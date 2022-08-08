@@ -5,15 +5,17 @@ import numpy as np
 from sklearn import metrics
 import alibi
 from alibi.explainers import TreeShap
+from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LogisticRegression
 from sklearn.linear_model import LinearRegression
 from imblearn.ensemble import BalancedRandomForestClassifier
 from imblearn.metrics import classification_report_imbalanced
+from sklearn.metrics import roc_auc_score
 from scipy.stats import sem
 import matplotlib.pyplot as plt
-from sklearn.model_selection import KFold, train_test_split, RandomizedSearchCV, LeaveOneOut
+from sklearn.model_selection import KFold, StratifiedKFold, train_test_split, RandomizedSearchCV, LeaveOneOut
 import joblib
 from itertools import  zip_longest
 from functools import partial
@@ -163,6 +165,10 @@ class RFShap(object):
                 elif self.balanced == None:
                     self.model = LogisticRegression(**config) if config != None else LogisticRegression()
                     self.model.class_weight = None
+        elif self.class_ == 'svm':
+            assert self.type_ == 'cls', print('If using SVM, make sure you have a classification problem. i.e. set type_="cls"')
+            self.model = SVC(**config) if config != None else SVC(kernel='rbf')
+
         print('Created: ', self.model)
         return self.model
 
@@ -188,11 +194,11 @@ class RFShap(object):
         assert self.model != None, 'model cannot be NoneType! Make sure it has been defined.'
         report = None
         if self.k_cv == 'k_fold' or self.k_cv == 'loo_cv':
-            report = self._train_eval_kloo(plot=plot)
+            report, conf_mat = self._train_eval_kloo(plot=plot)
 
         elif self.k_cv == 'split':
             self.model.fit(self.X_train, self.y_train.values.ravel())
-            report = self._eval_split()
+            report, conf_mat = self._eval_split()
         return self.model, report
 
     def _eval_split(self):
@@ -243,13 +249,18 @@ class RFShap(object):
 
         if self.type_ == 'cls':
             if self.k_cv == 'k_fold':
-                kf = KFold(n_splits=self.k, random_state=self.seed)
+                if self.balanced:
+                    kf = StratifiedKFold(n_splits=self.k, random_state=self.seed)
+                else:
+                    kf = KFold(n_splits=self.k, random_state=self.seed)
                 test_accs = []
                 tprs = []
                 aucs = []
                 tprs_2 = []
+                cms = []
                 fprs = []
                 precisions = []
+                rocaucscores = []
                 mccs = []
                 recalls = []
                 mean_fpr = np.linspace(0, 1, 100)
@@ -259,7 +270,8 @@ class RFShap(object):
                 f = 0
                 if self.n_categories <= 2:
                     fig, ax = plt.subplots(figsize=(14, 7))
-                for train_index, test_index in kf.split(self.X):
+                kf_ = kf.split(self.X, self.y) if self.balanced else kf.split(self.X)
+                for train_index, test_index in kf_:
                     f += 1
                     print('Training fold: ', f)
                     X_train, X_test = self.X.iloc[train_index], self.X.iloc[test_index]
@@ -272,9 +284,13 @@ class RFShap(object):
                     rep = classification_report_imbalanced(y_test, preds)
                     # rep = self.unravel_report(rep)
                     # report = self.combine_dicts(report, rep)
+                    print(probs.shape)
+                    rocaucscores.append(roc_auc_score(y_test, probs, average='macro', multi_class='ovr'))
                     rep = self.imblearn_rep_to_df(rep)
                     rep['fold'] = f
                     results = pd.concat([results, rep])
+                    cms.append(metrics.confusion_matrix(y_test, preds))
+
 
                     if self.n_categories <= 2:
                         mccs.append(metrics.matthews_corrcoef(y_test, preds))
@@ -291,6 +307,7 @@ class RFShap(object):
                         tprs.append(interp_tpr)
                         aucs.append(viz.roc_auc)
                     i += 1
+
 
                 if self.n_categories <= 2:
                     ax.plot([0, 1], [0, 1], linestyle='--', lw=2, color='r',
@@ -319,17 +336,10 @@ class RFShap(object):
                         plt.show()
                     plt.close()
 
-                #     recalls = np.asarray(recalls)
-                #     precisions = np.asarray(precisions)
-                #     tprs = np.asarray(tprs)
-                #     tprs_2 = np.asarray(tprs_2)
-                #     fprs = np.asarray(fprs)
-                #     aucs = np.asarray(aucs)
-                #     mccs = np.asarray(mccs)
-                #
-                # test_accs = np.asarray(test_accs)
-
+                print('accuracies', np.asarray(test_accs).mean())
+                print('roc score', np.asarray(rocaucscores).mean())
                 print(results)
+
 
                 if self.n_categories <= 2:
                     mccs = pd.DataFrame(mccs)
@@ -341,43 +351,50 @@ class RFShap(object):
                                                   '_mccs_k_fold.csv'), index=False)
                 # results = pd.DataFrame(dict([(k, pd.Series(v)) for k, v in report.items()]))
                 self.save_kfold_summary(results)
+                cms = np.asarray(cms).sum(0)
+
+
 
 
             elif self.k_cv == 'loo_cv':
-                kf = LeaveOneOut()
-                y_probs = []
-                y_preds = []
-                y_GTs = []
-                i = 0
-                for train_index, test_index in kf.split(self.X):
-                    i += 1
-                    print('Loo-cv split number: ', i)
-                    X_train, X_test = self.X.iloc[train_index], self.X.iloc[test_index]
-                    y_train, y_test = self.y.iloc[train_index], self.y.iloc[test_index]
-                    self.model = self.make_model(self.config)
-                    self.model.fit(X_train, y_train.values.ravel())
-                    pred = self.model.predict(X_test)
-                    prob = self.model.predict_proba(X_test)
-                    y_preds.append(pred)
-                    y_probs.append(prob)
-                    y_GTs.append(y_test.values[0])
+                    kf = LeaveOneOut()
+                    y_probs = []
+                    y_preds = []
+                    y_GTs = []
+                    i = 0
+                    for train_index, test_index in kf.split(self.X):
+                        i += 1
+                        print('Loo-cv split number: ', i)
+                        X_train, X_test = self.X.iloc[train_index], self.X.iloc[test_index]
+                        y_train, y_test = self.y.iloc[train_index], self.y.iloc[test_index]
+                        self.model = self.make_model(self.config)
+                        self.model.fit(X_train, y_train.values.ravel())
+                        pred = self.model.predict(X_test)
+                        prob = self.model.predict_proba(X_test)
+                        y_preds.append(pred)
+                        y_probs.append(prob)
+                        y_GTs.append(y_test.values[0])
 
-                y_GTs = np.asarray(y_GTs)
-                y_probs = np.asarray(y_probs)
-                y_preds = np.asarray(y_preds)
-                test_accs = 100 * metrics.accuracy_score(y_GTs, y_preds)
-                mcc = metrics.matthews_corrcoef(y_GTs, y_preds)
-                conf_mat = np.asarray(metrics.confusion_matrix(y_GTs, y_preds))
-                np.savetxt(os.path.join(self.output_dir, self.outcome_var + '_' + str(self.type_) + '_' + str(self.class_) + '_loocv_train_test_conf_mat.txt'), conf_mat)
-                results = classification_report_imbalanced(y_GTs, y_preds)
-                results = self.imblearn_rep_to_df(results)
-                results['mcc'] = mcc
-                results.to_csv(os.path.join(self.output_dir, str(self.type_) + '_' + str(self.class_) +
-                                              '_loocv_test_classification_report.csv'), index=False)
-                print(results)
+                    y_GTs = np.asarray(y_GTs)
+                    y_probs = np.asarray(y_probs)
+                    y_preds = np.asarray(y_preds)
+                    test_accs = 100 * metrics.accuracy_score(y_GTs, y_preds)
+                    mcc = metrics.matthews_corrcoef(y_GTs, y_preds)
+                    cms = np.asarray(metrics.confusion_matrix(y_GTs, y_preds))
+                    np.savetxt(os.path.join(self.output_dir, self.outcome_var + '_' + str(self.type_) + '_' + str(self.class_) + '_loocv_train_test_conf_mat.txt'))
+                    results = classification_report_imbalanced(y_GTs, y_preds)
+                    rocaucscore = roc_auc_score(y_GTs, y_probs, average='macro', multi_class='ovr')
+                    results = self.imblearn_rep_to_df(results)
+                    results['mcc'] = mcc
+                    results.to_csv(os.path.join(self.output_dir, str(self.type_) + '_' + str(self.class_) +
+                                                  '_loocv_test_classification_report.csv'), index=False)
+                    print(results)
+                    print('accuracies', test_accs)
+                    print('roc auc score', rocaucscore)
 
 
         elif self.type_ == 'reg':
+            cms = None
             if self.k_cv == 'k_fold':
                 kf = KFold(n_splits=self.k, random_state=self.seed)
                 expl_vars = []
@@ -455,7 +472,7 @@ class RFShap(object):
                 results.to_csv(os.path.join(self.output_dir, str(self.type_) + '_' + str(self.class_) +
                                             '_loocv_test_regression_report.csv'), index=False)
 
-        return results
+        return results, cms
 
 
     def tune_model(self, tunable_params=None, folds=3, n_iter=100):
@@ -466,6 +483,8 @@ class RFShap(object):
         :return: model with optimal hyperparameters
         """
         print('Tuning the following parameters: ', tunable_params)
+
+        assert self.class_ != 'svm', print('tuning not implemented for SVM yet')
 
         assert self.k_cv == 'split',\
             'k_cv must be set to "split" to allow hyperparameter tuning with a designated training set!'
@@ -576,7 +595,7 @@ class RFShap(object):
         return self.model
 
 
-    def run_shap_explainer(self, model):
+    def run_shap_explainer(self, model, check_additivity=True):
 
         """
         :param model: give it a trained model
@@ -584,12 +603,10 @@ class RFShap(object):
         """
         assert model is not None, 'Feed me a model : ]'
 
-        if self.k_cv == 'split':
-            X_test = self.X_test
-        elif self.k_cv == 'loo_cv' or self.k_cv == 'k_fold':
-            X_test = self.X
 
-        model_output = 'margin' if self.type_ == 'reg' else 'raw'
+        X_test = self.X
+
+        model_output = 'margin' if self.type_ == 'reg' else 'raw'   # if using RF classifier, raw is log odds
         print('Running Shap Explainer.')
         explainer = shap_vals = None
 
@@ -599,22 +616,22 @@ class RFShap(object):
         # note that the interventioanl option requires a 'background dataset'
 
         if self.class_ == 'RF':
-            explainer = shap.TreeExplainer(model=model, model_output=model_output, feature_perturbation="tree_path_dependent")
-            shap_vals = explainer.shap_values(X_test)
+            explainer = shap.TreeExplainer(model=model, model_output=model_output, feature_perturbation="tree_path_dependent", check_additivity=check_additivity)
+            shap_vals = explainer.shap_values(X_test, check_additivity=check_additivity)
 
             joblib.dump(explainer, os.path.join(self.output_dir, self.outcome_var + "_tree_explainer.sav"))
             joblib.dump(shap_vals, os.path.join(self.output_dir, self.outcome_var + "_tree_explainer_shap_values.sav"))
-        else:
-            explainer = shap.LinearExplainer(model, X_test)
-            shap_vals = explainer.shap_values(X_test)
+        elif self.class_ == 'lin':
+            explainer = shap.LinearExplainer(model, X_test, check_additivity=check_additivity)
+            shap_vals = explainer.shap_values(X_test, check_additivity=check_additivity)
             joblib.dump(explainer, os.path.join(self.output_dir, self.outcome_var + '_linear_explainer.sav'))
             joblib.dump(shap_vals, os.path.join(self.output_dir, self.outcome_var + '_linear_explainer_shap_values.sav'))
 
         inds = np.flip(np.argsort(np.abs(shap_vals).mean(0)))
         sorted_vals = np.abs(shap_vals).mean(0)[(inds)]
         imps = pd.DataFrame(sorted_vals).T
-        imps.columns = self.dataset.columns[inds]
-        ims_dir = os.path.join(self.output_dir, self.outcome_var + 'importances.csv')
+        imps.columns = self.X.columns[inds]
+        ims_dir = os.path.join(self.output_dir, self.outcome_var + '_importances.csv')
         imps.to_csv(ims_dir, index=False)
 
         return explainer, shap_vals
@@ -637,7 +654,7 @@ class RFShap(object):
         shap_vals_bootstraps = []
 
         if self.k_cv == 'split':
-            X_test_bootstrap = self.X_test
+            X_test_bootstrap = self.X
         elif self.k_cv == 'loo_cv' or self.k_cv == 'k_fold':
             X_test_bootstrap = self.X
         indices = np.arange(0, len(X_test_bootstrap))
@@ -662,6 +679,8 @@ class RFShap(object):
             elif self.class_ == 'lin':
                 explainer = shap.LinearExplainer(model, X_test_sample)
                 shap_vals = explainer.shap_values(X_test_sample)
+            elif self.class_ == 'svm':
+                print('Not implemented bootstrapped shap with svm yet')
 
             shap_vals_bootstraps.append(shap_vals)
 
@@ -738,7 +757,7 @@ class RFShap(object):
                 plt.close()
 
         if self.k_cv == 'split':
-            X_test_plot = self.X_test
+            X_test_plot = self.X
         elif self.k_cv == 'loo_cv' or self.k_cv == 'k_fold':
             X_test_plot = self.X
 
@@ -763,12 +782,15 @@ class RFShap(object):
                 plt.show()
                 plt.close()
 
+
             if self.class_ == 'RF':
                 shap.summary_plot(shap_values=shap_vals[class_ind], features=X_test_plot, max_display=num_display, plot_type='dot',
                               show=False)
-            else:
+            elif self.class_ == 'lin':
                 shap.summary_plot(shap_values=shap_vals, features=X_test_plot, max_display=num_display, plot_type='dot',
                               show=False)
+            elif self.class_ == 'svm':
+                print('not implemented shap for svm yet')
             plt.tight_layout()
             plt.savefig(os.path.join(self.output_dir, self.outcome_var +'_' + str(self.type_) + '_' +
                                      str(self.class_) + '_' + str(class_ind) + '_' + str(num_display) +'_shap_effects_summary.png'))
